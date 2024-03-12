@@ -129,7 +129,7 @@ def print_constraints(
                  '[get_cells -regex {\n')
     for module in modules:
       module = module.replace('[', r'\\[').replace('.', r'\\.')
-      output.write(f'  pfm_top_i/dynamic_region/.*/inst/.*/{module}\n')
+      output.write(f'  ext_platform_i/VitisRegion/.*/inst/.*/{module}\n')
     output.write('}]\n')
 
   # remove empty pblocks to prevent vitis complaints

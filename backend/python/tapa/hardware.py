@@ -66,6 +66,7 @@ DEFAULT_REGISTER_LEVEL = 3
 SUPPORTED_PART_NUM_PREFIXS = (
     'xcu280-',
     'xcu250-',
+    'xcvp1802-',
 )
 
 
@@ -115,10 +116,47 @@ def get_port_region(part_num: str, port_cat: str, port_id: int) -> str:
       f'unknown port_cat {port_cat}, port_id {port_id} for {part_num}')
 
 
+class xcvp1802_hardware():
+  part_num = 'xcvp1802-lsvc4072-2MP-e-S'
+  noc = {}
+
+  def __init__(self) -> None:
+    self.init_avail_noc()
+
+  def init_avail_noc(self):
+    # coarse region granularity
+    # 4 SLRs and each SLR is split vertically into two coarse regions
+    # COARSE_X0Y0 = CR_X0Y0:CR_X4Y4  | COARSE_X1Y0 = CR_X5Y0:CR_X9Y4
+    # COARSE_X0Y1 = CR_X0Y5:CR_X4Y7  | COARSE_X1Y1 = CR_X5Y5:CR_X9Y7
+    # COARSE_X0Y2 = CR_X0Y8:CR_X4Y10 | COARSE_X1Y2 = CR_X058:CR_X4910
+    # COARSE_X0Y3 = CR_X0Y11:CR_X4Y13| COARSE_X1Y3 = CR_X0Y51:CR_X4913
+    self.noc[(0, 0)] = 28
+    self.noc[(0, 1)] = 24
+    self.noc[(0, 2)] = 24
+    self.noc[(0, 3)] = 24
+    self.noc[(1, 0)] = 28
+    self.noc[(1, 1)] = 24
+    self.noc[(1, 2)] = 24
+    self.noc[(1, 3)] = 24
+
+  def get_port_region(self, port_cat: str) -> str:
+    if port_cat == "DDR" or port_cat == "LPDDR":
+      for coord, avail in self.noc.items():
+        if avail >= 2:
+          self.noc[coord] -= 2
+          return f'COARSE_X{coord[0]}Y{coord[1]}'
+      assert "Running out of available clock regions with NOC for memory port assignments"
+
+    raise NotImplementedError(
+      f'unknown port_cat {port_cat} for {self.part_num}')
+
+
 def get_slr_count(part_num: str):
   if part_num.startswith('xcu280-'):
     return 3
   elif part_num.startswith('xcu250-'):
+    return 4
+  elif part_num.startswith('xcvp1802-'):
     return 4
   else:
     raise NotImplementedError('unknown part_num %s', part_num)

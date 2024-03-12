@@ -202,14 +202,24 @@ def get_port_vertices(arg_name_to_external_port):
   """
   port_vertices = {}
 
+  port_count = 0
   for arg_name, external_port_name in arg_name_to_external_port.items():
-    port_cat, port_id = util.parse_port(external_port_name)
+    if "[" in external_port_name:
+      port_cat, port_id = util.parse_port(external_port_name)
+    else:
+      # Versal platforms does not support memory bank specifications using [:]
+      port_cat, port_id = external_port_name, None
+      port_count += 1
     if port_cat == 'HBM':
       area = get_hbm_controller_area()
     # the ddr will not overlap with user logic
     elif port_cat == 'DDR':
       area = get_zero_area()
     elif port_cat == 'PLRAM':
+      area = get_zero_area()
+    elif port_cat == 'LPDDR':
+      area = get_zero_area()
+    elif port_cat == 'MC_NOC0':
       area = get_zero_area()
     else:
       raise NotImplementedError(f'unrecognized port type {port_cat}')

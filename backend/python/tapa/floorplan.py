@@ -15,6 +15,7 @@ from tapa.hardware import (
     get_ctrl_instance_region,
     get_port_region,
     get_slr_count,
+    xcvp1802_hardware,
 )
 from tapa.task import Task
 from tapa.task_graph import get_edges, get_vertices
@@ -170,7 +171,7 @@ def _get_axi_pipeline_tcl(config_with_floorplan) -> List[str]:
     vivado_tcl.append(
         f'add_cells_to_pblock [get_pblocks {region}] [get_cells -regex {{')
     vivado_tcl += [
-        f'  pfm_top_i/dynamic_region/.*/inst/{inst}' for inst in inst_list
+        f'  ext_platform_i/VitisRegion/.*/inst/{inst}' for inst in inst_list
     ]
     vivado_tcl.append(f'}} ]')
 
@@ -197,6 +198,9 @@ def get_vivado_tcl(config_with_floorplan):
   num_copy = get_slr_count(config_with_floorplan['part_num'])
   for i in range(num_copy):
     region_to_inst[f'pblock_dynamic_SLR{i}'].append(f'control_s_axi_U_slr_{i}')
+    # slr pblock definitions
+    vivado_tcl.append(f"create_pblock pblock_dynamic_SLR{i}")
+    vivado_tcl.append(f"resize_pblock pblock_dynamic_SLR{i} -add [get_slrs SLR{i}]")
 
   # tapa central FSM
   region_to_inst[f'pblock_dynamic_SLR0'].append('tapa_state.*')
@@ -232,7 +236,7 @@ def get_vivado_tcl(config_with_floorplan):
     # note the .* after inst
     # this is because we add a wrapper around user logic for AXI pipelining
     vivado_tcl += [
-        f'  pfm_top_i/dynamic_region/.*/inst/.*/{inst}' for inst in inst_list
+        f'  ext_platform_i/VitisRegion/.*/inst/.*/{inst}' for inst in inst_list
     ]
     vivado_tcl.append(f'}} ]')
 
@@ -383,12 +387,23 @@ def get_floorplan_pre_assignments(
 
   # port vertices pre assignment
   skip_pre_assign_hbm_ports = kwargs.get('enable_hbm_binding_adjustment', False)
+  if part_num.startswith("xcvp1802-"):
+    hardware = xcvp1802_hardware()
+
+  v_pre_assigned = list(itertools.chain.from_iterable(floorplan_pre_assignments.values()))
   for v_name, properties in vertices.items():
     if properties['category'] == 'PORT_VERTEX':
       if skip_pre_assign_hbm_ports and properties['port_cat'] == 'HBM':
         continue
-      region = get_port_region(part_num, properties['port_cat'],
-                               properties['port_id'])
+      # skip if user-predefined
+      if v_name in v_pre_assigned:
+        continue
+      elif part_num.startswith("xcvp1802-"):
+        continue  # skip port assignment due to Versal NoC
+        region = hardware.get_port_region(properties['port_cat'])
+      else:
+        region = get_port_region(part_num, properties['port_cat'],
+                                 properties['port_id'])
       floorplan_pre_assignments[region].append(v_name)
 
   return floorplan_pre_assignments
