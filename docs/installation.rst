@@ -90,7 +90,7 @@ Runtime Dependency
 
 * Clang 17 and its headers
 
-  * ``sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)" 17 all``
+  * ``sudo bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)" bash 17 all``
 
 * Vitis 2020.2+
 * `Xilinx Runtime <https://github.com/Xilinx/XRT>`_
@@ -163,6 +163,7 @@ This number should be adjusted according to your available cores and memory.
 .. code-block:: bash
 
   sudo ln -sf "${PWD}"/backend/tapacc /usr/local/bin/
+  sudo ln -sf "${PWD}"/backend/tapa-clang /usr/local/bin/
   sudo ln -sf "${PWD}"/../src/tapa{,.h} /usr/local/include/
   sudo ln -sf "${PWD}"/libtapa.{a,so} /usr/local/lib/
 
