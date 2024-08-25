@@ -22,7 +22,6 @@ from haoda.backend import xilinx as hls
 
 from tapa import util
 from tapa.codegen.axi_pipeline import get_axi_pipeline_wrapper
-from tapa.codegen.duplicate_s_axi_control import duplicate_s_axi_ctrl
 from tapa.floorplan import (
     checkpoint_floorplan,
     generate_floorplan,
@@ -269,7 +268,6 @@ class Program:
   def generate_task_rtl(
       self,
       additional_fifo_pipelining: bool = False,
-      part_num: str = '',
   ) -> 'Program':
     """Extract HDL files from tarballs generated from HLS."""
     _logger.info('extracting RTL files')
@@ -325,7 +323,6 @@ class Program:
       if task.is_upper and task.name != self.top:
         self._instrument_non_top_upper_task(
             task,
-            part_num,
             additional_fifo_pipelining,
         )
 
@@ -404,19 +401,13 @@ class Program:
     Returns:
         Program: Return self.
     """
-    task_inst_to_slr = {}
-
     # extract the floorplan result
     if constraint is not None:
       (
           fifo_pipeline_level,
           axi_pipeline_level,
-          task_inst_to_slr,
           fifo_to_depth,
       ) = get_floorplan_result(self.autobridge_dir, constraint)
-
-      if not task_inst_to_slr:
-        _logger.warning('generate top rtl without floorplanning')
 
       self.top_task.module.fifo_partition_count = fifo_pipeline_level
       self.top_task.module.axi_pipeline_level = axi_pipeline_level
@@ -454,8 +445,6 @@ class Program:
     _logger.info('instrumenting top-level RTL')
     self._instrument_top_task(
         self.top_task,
-        part_num,
-        task_inst_to_slr,
         additional_fifo_pipelining,
         print_fifo_ops,
     )
@@ -591,7 +580,6 @@ class Program:
       self,
       task: Task,
       width_table: Dict[str, int],
-      instance_name_to_slr: Dict[str, int],
   ) -> List[ast.Identifier]:
     _logger.debug('  instantiating children tasks in %s', task.name)
     is_done_signals: List[rtl.Pipeline] = []
@@ -600,73 +588,71 @@ class Program:
 
     task.add_m_axi(width_table, self.files)
 
-    # now that each SLR has an control_s_axi, slightly reduce the
-    # pipeline level of the scalars
-    if instance_name_to_slr:
-      scalar_register_level = 2
-    else:
-      scalar_register_level = self.register_level
-
-    fsm_portargs: List[ast.PortArg] = [
+    # Wires connecting to the upstream (s_axi_control).
+    fsm_upstream_portargs: List[ast.PortArg] = [
         ast.make_port_arg(x, x)
         for x in rtl.HANDSHAKE_INPUT_PORTS + rtl.HANDSHAKE_OUTPUT_PORTS
     ]
+    fsm_upstream_module_ports = {}  # keyed by arg.name for deduplication
     task.fsm_module.add_ports([
-        ast.Decl((ast.make_pragma('RS_CLK'), ast.Input(rtl.HANDSHAKE_CLK))),
-        ast.Decl((
-            ast.make_pragma('RS_RST', 'ff'),
-            ast.Input(rtl.HANDSHAKE_RST_N),
-        )),
-        ast.Decl((
-            ast.make_pragma('RS_AP_CTRL', f'{task.name}.{rtl.HANDSHAKE_START}'),
-            ast.Input(rtl.HANDSHAKE_START),
-        )),
-        ast.Decl((
-            ast.make_pragma('RS_AP_CTRL', f'{task.name}.{rtl.HANDSHAKE_READY}'),
-            ast.Output(rtl.HANDSHAKE_READY),
-        )),
-        *(ast.Decl((
-            ast.make_pragma('RS_FF', rtl.wire_name(task.name, x)),
-            ast.Output(x),
-        )) for x in (rtl.HANDSHAKE_DONE, rtl.HANDSHAKE_IDLE)),
+        ast.Input(rtl.HANDSHAKE_CLK),
+        ast.Input(rtl.HANDSHAKE_RST_N),
+        ast.Input(rtl.HANDSHAKE_START),
+        ast.Output(rtl.HANDSHAKE_READY),
+        *(ast.Output(x) for x in (rtl.HANDSHAKE_DONE, rtl.HANDSHAKE_IDLE)),
     ])
 
-    for instance in task.instances:
-      # connect to the control_s_axi in the corresponding SLR
-      if instance.name in instance_name_to_slr:
-        argname_suffix = f'_slr_{instance_name_to_slr[instance.name]}'
-      else:
-        argname_suffix = ''
+    # Wires connecting to the downstream (task instances).
+    fsm_downstream_portargs: List[ast.PortArg] = []
+    fsm_downstream_module_ports = []
 
+    for instance in task.instances:
       child_port_set = set(instance.task.module.ports)
 
       # add signal delcarations
       for arg in instance.args:
         if not arg.cat.is_stream:
+          # Find arg width.
           width = 64  # 64-bit address
           if arg.cat.is_scalar:
             width = width_table.get(arg.name, 0)
             if width == 0:
+              # Constant literals are not in the width table.
               width = int(arg.name.split("'d")[0])
-          q = rtl.Pipeline(
-              name=instance.get_instance_arg(arg.name),
-              level=scalar_register_level,
-              width=width,
-          )
-          arg_table[arg.name] = q
 
+          # Find identifier name of the arg. May be a constant with "'d" in it.
           # If `arg` is an hmap, `arg.name` refers to the mmap offset, which
           # needs to be set to 0. The actual address mapping will be handled
           # between the AXI interconnect and the upstream M-AXI interface.
           if arg.chan_count is not None:
             id_name = "64'd0"
           # arg.name may be a constant
-          elif arg.name in width_table:
-            id_name = arg.name + argname_suffix
           else:
             id_name = arg.name
-          task.module.add_pipeline(q, init=ast.Identifier(id_name))
-          _logger.debug("    pipelined signal: %s => %s", id_name, q.name)
+
+          # Instantiate a pipeline for the arg.
+          q = rtl.Pipeline(
+              name=instance.get_instance_arg(id_name),
+              level=self.register_level,
+              width=width,
+          )
+          arg_table[arg.name] = q
+
+          # Add signals only for non-consts. Constants are passed as literals.
+          if "'d" not in q.name:
+            task.module.add_signals([
+                ast.Wire(name=q[-1].name, width=ast.make_width(width)),
+            ])
+            task.fsm_module.add_pipeline(q, init=ast.Identifier(id_name))
+            _logger.debug("    pipelined signal: %s => %s", id_name, q.name)
+            fsm_upstream_module_ports.setdefault(
+                arg.name,
+                ast.Input(arg.name, ast.make_width(width)),
+            )
+            fsm_downstream_module_ports.append(
+                ast.Output(q[-1].name, ast.make_width(width)))
+            fsm_downstream_portargs.append(
+                ast.make_port_arg(q[-1].name, q[-1].name))
 
         # arg.name is the upper-level name
         # arg.port is the lower-level name
@@ -678,6 +664,7 @@ class Program:
                 tag=tag,
                 port=arg.port,
                 arg=arg.name,
+                offset_name=arg_table[arg.name][-1],
                 instance=instance,
             )) & child_port_set:
               async_mmap_args.setdefault(arg, []).append(tag)
@@ -794,13 +781,13 @@ class Program:
         is_done_signals.append(is_done_q)
 
       # insert handshake signals
-      fsm_portargs.extend(
+      fsm_downstream_portargs.extend(
           ast.make_port_arg(x.name, x.name)
           for x in instance.public_handshake_signals)
       task.module.add_signals(
           ast.Wire(x.name, x.width) for x in instance.public_handshake_signals)
       task.fsm_module.add_signals(instance.all_handshake_signals)
-      task.fsm_module.add_ports(instance.public_handshake_ports)
+      fsm_downstream_module_ports.extend(instance.public_handshake_ports)
 
       # add task module instances
       portargs = list(rtl.generate_handshake_ports(instance, rtl.RST_N))
@@ -835,6 +822,7 @@ class Program:
                     tag=tag,
                     port=arg.port,
                     arg=arg.mmap_name,
+                    offset_name=arg_table[arg.name][-1],
                     instance=instance,
                 ))
 
@@ -843,6 +831,12 @@ class Program:
           instance_name=instance.name,
           ports=portargs,
       )
+
+    # Add scalar ports to the FSM module.
+    for x in fsm_upstream_module_ports.values():
+      fsm_upstream_portargs.append(ast.make_port_arg(x.name, x.name))
+    task.fsm_module.add_ports(fsm_upstream_module_ports.values())
+    task.fsm_module.add_ports(fsm_downstream_module_ports)
 
     # instantiate async_mmap modules at the upper levels
     # the base address may not be 0, so must use full 64 bit
@@ -853,7 +847,6 @@ class Program:
       for arg in async_mmap_args:
         task.module.add_async_mmap_instance(
             name=arg.mmap_name,
-            offset_name=arg_table[arg.name][-1],
             tags=async_mmap_args[arg],
             rst=rtl.RST,
             data_width=width_table[arg.name],
@@ -863,7 +856,7 @@ class Program:
       task.module.add_instance(
           module_name=task.fsm_module.name,
           instance_name='__tapa_fsm_unit',
-          ports=fsm_portargs,
+          ports=fsm_upstream_portargs + fsm_downstream_portargs,
       )
 
     return is_done_signals
@@ -964,12 +957,12 @@ class Program:
   def _instrument_non_top_upper_task(
       self,
       task: Task,
-      part_num: str,
       additional_fifo_pipelining: bool = False,
   ) -> None:
     """ codegen for upper but non-top tasks """
     assert task.is_upper
     task.module.cleanup()
+    task.add_rs_pragmas_to_fsm()
 
     self._instantiate_fifos(task, additional_fifo_pipelining)
     self._connect_fifos(task)
@@ -977,9 +970,11 @@ class Program:
     is_done_signals = self._instantiate_children_tasks(
         task,
         width_table,
-        {},
     )
-    self._instantiate_global_fsm(task.module, is_done_signals)
+    self._instantiate_global_fsm(task.fsm_module, is_done_signals)
+
+    with open(self.get_rtl(task.fsm_module.name), 'w') as rtl_code:
+      rtl_code.write(task.fsm_module.code)
 
     with open(self.get_rtl(task.name), 'w') as rtl_code:
       rtl_code.write(task.module.code)
@@ -987,19 +982,13 @@ class Program:
   def _instrument_top_task(
       self,
       task: Task,
-      part_num: str,
-      instance_name_to_slr: Dict[str, int],
       additional_fifo_pipelining: bool,
       print_fifo_ops: bool,
   ) -> None:
     """ codegen for the top task """
     assert task.is_upper
     task.module.cleanup()
-
-    # if floorplan is enabled, add a control_s_axi instance in each SLR
-    if instance_name_to_slr:
-      num_slr = get_slr_count(part_num)
-      duplicate_s_axi_ctrl(task, num_slr)
+    task.add_rs_pragmas_to_fsm()
 
     self._instantiate_fifos(task, additional_fifo_pipelining, print_fifo_ops)
     self._connect_fifos(task)
@@ -1007,34 +996,14 @@ class Program:
     is_done_signals = self._instantiate_children_tasks(
         task,
         width_table,
-        instance_name_to_slr,
     )
     self._instantiate_global_fsm(task.fsm_module, is_done_signals)
 
     with open(self.get_rtl(task.fsm_module.name), 'w') as rtl_code:
       rtl_code.write(task.fsm_module.code)
 
-    if instance_name_to_slr:
-      # if floorplan is enabled, pipeline the top-level task
-      self._pipeline_top_task(task)
-    else:
-      # otherwise, generate the top-level task as-is
-      with open(self.get_rtl(task.name), 'w') as rtl_code:
-        rtl_code.write(task.module.code)
-
-  def _pipeline_top_task(self, task: Task) -> None:
-    """
-    add axi pipelines to the top task
-    """
-    # generate the original top module. Append a suffix to it
-    top_suffix = '_inner'
-    task.module.name += top_suffix
-    with open(self.get_rtl(task.name + top_suffix), 'w') as rtl_code:
-      rtl_code.write(task.module.code)
-
-    # generate the wrapper that becomes the final top module
     with open(self.get_rtl(task.name), 'w') as rtl_code:
-      rtl_code.write(get_axi_pipeline_wrapper(task.name, top_suffix, task))
+      rtl_code.write(task.module.code)
 
   def _get_fifo_width(self, task: Task, fifo: str) -> int:
     producer_task, _, fifo_port = task.get_connection_to(fifo, 'produced_by')

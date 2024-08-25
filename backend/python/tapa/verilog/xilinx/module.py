@@ -127,10 +127,14 @@ class Module:
       elif isinstance(item, ast.InstanceList):
         self._next_instance_idx = idx + 1
 
-    # if the item type is not present, set idx to the array bound
-    for attr in 'io_port', 'signal', 'param', 'logic', 'instance':
-      if not hasattr(self, f'_next_{attr}_idx'):
-        setattr(self, f'_next_{attr}_idx', 0)
+    # if an attr type is not present, set its idx to the previous attr type
+    last_idx = 0
+    for attr in self._ATTRS:
+      idx = getattr(self, f'_next_{attr}_idx', None)
+      if idx is None:
+        setattr(self, f'_next_{attr}_idx', last_idx)
+      else:
+        last_idx = idx
 
   @property
   def _module_def(self) -> ast.ModuleDef:
@@ -536,7 +540,6 @@ class Module:
       buffer_size: Optional[int] = None,
       max_wait_time: int = 3,
       max_burst_len: Optional[int] = None,
-      offset_name: str = '',
   ) -> 'Module':
     paramargs = [
         ast.ParamArg(paramname='DataWidth', argname=ast.Constant(data_width)),
@@ -563,9 +566,6 @@ class Module:
     paramargs.append(
         ast.ParamArg(paramname='MaxWaitTime',
                      argname=ast.Constant(max(1, max_wait_time))))
-
-    # the base address for this memory channel
-    portargs.append(ast.make_port_arg(port='offset', arg=offset_name or name))
 
     if max_burst_len is None:
       # 1KB burst length

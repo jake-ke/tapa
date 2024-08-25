@@ -9,7 +9,9 @@
 #include <sys/wait.h>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <type_traits>
+#include <utility>
 
 #include <frt.h>
 
@@ -42,10 +44,15 @@ struct invoker;
 template <typename... Params>
 struct invoker<void (&)(Params...)> {
   template <typename... Args>
-  static void invoke(bool detach, void (&f)(Params...), Args&&... args) {
+  static void invoke(int mode, void (&f)(Params...), Args&&... args) {
     // std::bind creates a copy of args
-    internal::schedule(detach, std::bind(f, accessor<Params, Args>::access(
-                                                std::forward<Args>(args))...));
+    auto functor = std::bind(
+        f, accessor<Params, Args>::access(std::forward<Args>(args))...);
+    if (mode > 0) {  // Sequential scheduling.
+      std::move(functor)();
+    } else {
+      internal::schedule(/*detach=*/mode < 0, std::move(functor));
+    }
   }
 
   template <typename... Args>
@@ -121,12 +128,12 @@ struct invoker<void (&)(Params...)> {
 /// Detached tasks are very useful when infinite loops can be used.
 struct task {
   /// Constructs a @c tapa::task.
-  task();
-  task(task&&) = delete;
-  task(const task&) = delete;
+  explicit task();
+
   ~task();
 
-  task& operator=(task&&) = delete;
+  // Not copyable or movable.
+  task(const task&) = delete;
   task& operator=(const task&) = delete;
 
   /// Invokes a task and instantiates a child task instance.
@@ -165,7 +172,7 @@ struct task {
         std::is_function_v<typename std::remove_reference_t<Func>>,
         "the first argument for tapa::task::invoke() must be a function");
     internal::invoker<Func>::template invoke<Args...>(
-        /* detach= */ mode < 0, std::forward<Func>(func),
+        mode_override.value_or(mode), std::forward<Func>(func),
         std::forward<Args>(args)...);
     return *this;
   }
@@ -191,6 +198,9 @@ struct task {
     }
     return *this;
   }
+
+ protected:
+  std::optional<int> mode_override;
 };
 
 }  // namespace tapa

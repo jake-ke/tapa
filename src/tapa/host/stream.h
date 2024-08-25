@@ -8,16 +8,20 @@
 #include <array>
 #include <atomic>
 #include <deque>
+#include <fstream>
+#include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <glog/logging.h>
 
 #include "tapa/base/stream.h"
-
 #include "tapa/host/coroutine.h"
+#include "tapa/host/util.h"
 
 namespace tapa {
 
@@ -38,30 +42,53 @@ namespace internal {
 template <typename Param, typename Arg>
 struct accessor;
 
-class base_queue {
+class type_erased_queue {
  public:
+  virtual ~type_erased_queue() = default;
+
   // debug helpers
-  const std::string& get_name() const { return this->name; }
-  void set_name(const std::string& name) { this->name = name; }
-
- protected:
-  std::string name;
-
-  base_queue(const std::string& name) : name(name) {}
+  const std::string& get_name() const;
+  void set_name(const std::string& name);
 
   virtual bool empty() const = 0;
+  virtual bool full() const = 0;
 
-  void check_leftover() {
-    if (!this->empty()) {
-      LOG(WARNING) << "channel '" << this->name
-                   << "' destructed with leftovers; hardware behavior may be "
-                      "unexpected in consecutive invocations";
+ protected:
+  struct LogContext {
+    static std::unique_ptr<LogContext> New(std::string_view name);
+    std::ofstream ofs;
+    std::mutex mtx;
+  };
+
+  std::string name;
+  const std::unique_ptr<LogContext> log;
+
+  type_erased_queue(const std::string& name);
+
+  void check_leftover() const;
+
+  template <typename T>
+  void maybe_log(const T& elem) {
+    if (this->log != nullptr) {
+      std::unique_lock<std::mutex> lock(this->log->mtx);
+      this->log->ofs << elem << std::endl;
     }
   }
 };
 
 template <typename T>
-class lock_free_queue : public base_queue {
+class base_queue : public type_erased_queue {
+ public:
+  virtual void push(const T& val) = 0;
+  virtual T pop() = 0;
+  virtual const T& front() const = 0;
+
+ protected:
+  using type_erased_queue::type_erased_queue;
+};
+
+template <typename T>
+class lock_free_queue : public base_queue<T> {
   // producer writes to head and consumer reads from tail
   // okay to keep incrementing because it'll take > 100 yr to overflow uint64_t
   std::atomic<uint64_t> tail{0};
@@ -71,8 +98,7 @@ class lock_free_queue : public base_queue {
 
  public:
   // constructors
-  lock_free_queue(size_t depth, const std::string& name = "")
-      : base_queue(name) {
+  lock_free_queue(size_t depth, const std::string& name) : base_queue<T>(name) {
     this->buffer.resize(depth);
   }
 
@@ -81,14 +107,19 @@ class lock_free_queue : public base_queue {
 
   // basic queue operations
   bool empty() const override { return this->head - this->tail <= 0; }
-  bool full() const { return this->head - this->tail >= this->buffer.size(); }
-  const T& front() const { return this->buffer[this->tail % buffer.size()]; }
-  T pop() {
+  bool full() const override {
+    return this->head - this->tail >= this->buffer.size();
+  }
+  const T& front() const override {
+    return this->buffer[this->tail % buffer.size()];
+  }
+  T pop() override {
     auto val = this->front();
     ++this->tail;
     return val;
   }
-  void push(const T& val) {
+  void push(const T& val) override {
+    this->maybe_log(val);
     this->buffer[this->head % buffer.size()] = val;
     ++this->head;
   }
@@ -97,15 +128,15 @@ class lock_free_queue : public base_queue {
 };
 
 template <typename T>
-class locked_queue : public base_queue {
+class locked_queue : public base_queue<T> {
   size_t depth;
   mutable std::mutex mtx;
   std::deque<T> buffer;
 
  public:
   // constructors
-  locked_queue(size_t depth, const std::string& name = "")
-      : base_queue(name), depth(depth) {}
+  locked_queue(size_t depth, const std::string& name)
+      : base_queue<T>(name), depth(depth) {}
 
   // debug helpers
   uint64_t get_depth() const { return this->depth; }
@@ -115,22 +146,23 @@ class locked_queue : public base_queue {
     std::unique_lock<std::mutex> lock(this->mtx);
     return this->buffer.empty();
   }
-  bool full() const {
+  bool full() const override {
     std::unique_lock<std::mutex> lock(this->mtx);
     return this->buffer.size() >= this->depth;
   }
-  const T& front() const {
+  const T& front() const override {
     std::unique_lock<std::mutex> lock(this->mtx);
     return this->buffer.front();
   }
-  T pop() {
+  T pop() override {
     std::unique_lock<std::mutex> lock(this->mtx);
     auto val = this->buffer.front();
     this->buffer.pop_front();
     return val;
   }
-  void push(const T& val) {
+  void push(const T& val) override {
     std::unique_lock<std::mutex> lock(this->mtx);
+    this->maybe_log(val);
     this->buffer.push_back(val);
   }
 
@@ -154,14 +186,14 @@ class basic_stream {
   uint64_t get_depth() const { return this->ptr->get_depth(); }
 
   // not protected since we'll use std::vector<basic_stream<T>>
-  basic_stream(const std::shared_ptr<queue<elem_t<T>>>& ptr) : ptr(ptr) {}
+  basic_stream(const std::shared_ptr<base_queue<elem_t<T>>>& ptr) : ptr(ptr) {}
   basic_stream(const basic_stream&) = default;
   basic_stream(basic_stream&&) = default;
   basic_stream& operator=(const basic_stream&) = default;
   basic_stream& operator=(basic_stream&&) = delete;  // -Wvirtual-move-assign
 
  protected:
-  std::shared_ptr<queue<elem_t<T>>> ptr;
+  std::shared_ptr<base_queue<elem_t<T>>> ptr;
 };
 
 // shared pointer of multiple queues
@@ -209,6 +241,46 @@ class unbound_streams : public istreams<T, S>, public ostreams<T, S> {
  protected:
   unbound_streams() : basic_streams<T>(nullptr) {}
 };
+
+template <typename T, typename = void>
+struct has_ostream_overload : std::false_type {};
+
+template <typename T>
+struct has_ostream_overload<
+    T,
+    std::void_t<decltype(std::declval<std::ostream&>() << std::declval<T>())>>
+    : std::true_type {};
+
+template <typename T>
+std::ostream& operator<<(std::ostream& os, const elem_t<T>& elem) {
+  if (elem.eot) {
+    // For EoT, create an empty line.
+  } else if constexpr (has_ostream_overload<T>::value) {
+    // For types that overload `operator<<`, use that.
+    os << elem.val;
+  } else {
+    // For types that do not overload `operator<<`, dump bytes in dex.
+    auto bytes = bit_cast<std::array<char, sizeof(elem.val)>>(elem.val);
+    os << "0x" << std::hex;
+    for (int byte : bytes) {
+      os << std::setfill('0') << std::setw(2) << byte;
+    }
+  }
+  return os;
+}
+
+constexpr uint64_t kInfiniteDepth = std::numeric_limits<uint64_t>::max();
+
+template <typename T>
+std::shared_ptr<base_queue<T>> make_queue(uint64_t depth,
+                                          const std::string& name = "") {
+  if (depth == kInfiniteDepth) {
+    // It's too expensive to make the lock-free queue have infinite depth.
+    return std::make_shared<locked_queue<T>>(depth, name);
+  } else {
+    return std::make_shared<queue<T>>(depth, name);
+  }
+}
 
 }  // namespace internal
 
@@ -585,7 +657,7 @@ class stream : public internal::unbound_stream<T> {
   /// Constructs a @c tapa::stream.
   stream()
       : internal::basic_stream<T>(
-            std::make_shared<internal::queue<internal::elem_t<T>>>(N)) {}
+            internal::make_queue<internal::elem_t<T>>(N)) {}
 
   /// Constructs a @c tapa::stream with the given name for debugging.
   ///
@@ -593,7 +665,7 @@ class stream : public internal::unbound_stream<T> {
   template <size_t S>
   stream(const char (&name)[S])
       : internal::basic_stream<T>(
-            std::make_shared<internal::queue<internal::elem_t<T>>>(N, name)) {}
+            internal::make_queue<internal::elem_t<T>>(N, name)) {}
 
  private:
   template <typename U, uint64_t friend_length, uint64_t friend_depth>
@@ -739,7 +811,7 @@ class streams : public internal::unbound_streams<T, S> {
                 "", 0)) {
     for (int i = 0; i < S; ++i) {
       this->ptr->refs.emplace_back(
-          std::make_shared<internal::queue<internal::elem_t<T>>>(N));
+          internal::make_queue<internal::elem_t<T>>(N));
     }
   }
 
@@ -755,9 +827,8 @@ class streams : public internal::unbound_streams<T, S> {
             std::make_shared<typename internal::basic_streams<T>::metadata_t>(
                 name, 0)) {
     for (int i = 0; i < S; ++i) {
-      this->ptr->refs.emplace_back(
-          std::make_shared<internal::queue<internal::elem_t<T>>>(
-              N, this->ptr->name + "[" + std::to_string(i) + "]"));
+      this->ptr->refs.emplace_back(internal::make_queue<internal::elem_t<T>>(
+          N, this->ptr->name + "[" + std::to_string(i) + "]"));
     }
   }
 
